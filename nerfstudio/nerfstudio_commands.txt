@@ -1,339 +1,114 @@
-# Nerfstudio Commands Guide
+# Nerfstudio Pipeline Guide
 # =========================
 
-## Prerequisites Installation
-# ---------------------------
-# Install ffmpeg
-sudo apt update && sudo apt install ffmpeg -y
-
-# Install COLMAP
-sudo apt install colmap -y
-# OR via conda:
-conda install -c conda-forge colmap
-
-# Verify installations
-ffmpeg -version
-colmap -h
+## Prerequisites
+# --------------
+sudo apt update && apt install ffmpeg colmap -y
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
 
-## Basic Workflow
-# ---------------
+## Docker Setup (REQUIRED for Gaussian Splatting)
+# ------------------------------------------------
+docker pull ghcr.io/nerfstudio-project/nerfstudio:latest
 
-# 1. Process video to extract frames and run COLMAP
-ns-process-data video --data video/IMG_7056.MOV --output-dir data/IMG_7056
-
-# Optional: Process with specific number of frames
-ns-process-data video --data video/IMG_7056.MOV --output-dir data/IMG_7056 --num-frames-target 300
-
-
-# 2. Train the NeRF model
-ns-train nerfacto --data data/IMG_7056
-
-# Train with viewer enabled
-ns-train nerfacto --data data/IMG_7056 --viewer.start
-
-# Train with different methods
-ns-train instant-ngp --data data/IMG_7056
-ns-train splatfacto --data data/IMG_7056
-
-# Train with custom output directory
-ns-train nerfacto --data data/IMG_7056 --output-dir outputs/IMG_7056
-
-# Train with specific number of iterations
-ns-train nerfacto --data data/IMG_7056 --max-num-iterations 30000
+# Start Docker container
+docker run --gpus all \
+  -v /mnt/c/python_work/git/data/nerfstudio:/workspace \
+  -v ~/.cache:/home/user/.cache \
+  -p 7007:7007 --rm -it --shm-size=12gb \
+  ghcr.io/nerfstudio-project/nerfstudio:latest bash
 
 
-## Viewing Trained Models
-# -----------------------
+## Complete Pipeline: Video → Training Dataset with Masks
+# ---------------------------------------------------------
 
-# View a trained model (replace timestamp with your actual timestamp)
-ns-viewer --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml
+# Step 1: Process video (extract frames + COLMAP poses)
+ns-process-data video --data video/MY_VIDEO.mp4 --output-dir data/my_object
 
-# Open browser to: http://localhost:7007
+# Step 2: Train Gaussian Splatting (inside Docker)
+cd /workspace
+ns-train splatfacto --data data/my_object --output-dir data/my_object --viewer.start-on-train False
 
+# Step 3: Export to .ply
+ns-export gaussian-splat --load-config data/my_object/splatfacto/<timestamp>/config.yml --output-dir exports/combined_gaussian/
 
-## Rendering Videos
-# -----------------
+# Step 4: (Optional) Crop in SuperSplat
+# Download from: https://github.com/playcanvas/super-splat/releases
+# Import .ply → Select unwanted parts → Press 'I' → Delete → Export
 
-# Render interpolated video (easiest - no camera path needed)
-ns-render interpolate --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --output-path renders/interpolated.mp4
+# Step 5: Generate dataset with RGB + Mask + Camera calibration
+cd /workspace/exports/combined_gaussian
+pip3 install ultralytics
+python render_yolo.py --ply splat.ply --views 200 --out training_dataset
 
-# Render with custom camera path (requires camera_path.json from viewer)
-ns-render camera-path --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --camera-path-filename camera_path.json --output-path renders/output.mp4
-
-# Render with more frames for smoother video
-ns-render interpolate --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --output-path renders/interpolated.mp4 --interpolation-steps 100
-
-
-## Exporting Models
-# -----------------
-
-# Export to mesh (Poisson reconstruction)
-ns-export poisson --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --output-dir exports/mesh/
-
-# Export to point cloud
-ns-export pointcloud --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --output-dir exports/pointcloud/ --num-points 1000000
-
-# Export to gaussian splat
-ns-export gaussian-splat --load-config outputs/IMG_7056/nerfacto/2025-11-24_182849/config.yml --output-dir exports/splat/
+# Output: training_dataset/ with render_XXXX.png, render_XXXX_mask.png, render_XXXX_camera.json
 
 
-## GPU Monitoring
-# ---------------
+## render_yolo.py Usage
+# ---------------------
 
-# Check GPU status (one-time)
-nvidia-smi
+# Single view (testing)
+python render_yolo.py
 
-# Monitor GPU continuously (updates every 1 second)
-watch -n 1 nvidia-smi
+# Multiple views
+python render_yolo.py --views 100
 
-# Check if PyTorch can see GPU
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); print(f'GPU name: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else "None"}')"
+# Full options
+python render_yolo.py --ply FILE.ply --out DIR --views 200 --size 1920 1080 --model yolov8m-seg.pt --conf 0.1
+
+
+## Output Format
+# --------------
+
+# Each view generates 3 files:
+# - render_XXXX.png        → RGB image
+# - render_XXXX_mask.png   → Binary mask (white=object, black=background)
+# - render_XXXX_camera.json → {"pos": [x,y,z], "look_at": [x,y,z], "K": [[...]], "focal": 2058, "size": [w,h]}
+
+
+## How It Works
+# -------------
+
+# 1. Load .ply (Gaussian parameters: position, color, scale, rotation, opacity)
+# 2. Calculate camera positions orbiting the object (360° horizontal, ±30° vertical)
+# 3. Render using gsplat.rasterization (GPU-accelerated)
+# 4. Segment objects using YOLOv8 instance segmentation
+# 5. Save RGB, mask, and camera calibration
 
 
 ## Troubleshooting
 # ----------------
 
-# If you get PyTorch 2.6+ checkpoint loading errors, downgrade:
-pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu118
+# Wrong mask (captures platform instead of object):
+#   → Use render_yolo.py with --conf 0.1
+#   → OR crop unwanted parts in SuperSplat first
 
-# Install tiny-cuda-nn for faster training (optional but recommended)
-pip install git+https://github.com/NVlabs/tiny-cuda-nn/#subdirectory=bindings/torch
+# YOLO detects only partial object:
+#   → Lower confidence: --conf 0.05
+#   → Larger model: --model yolov8m-seg.pt
 
+# pip not found in Docker:
+#   → Use: python3 -m pip install ultralytics
 
-## Common Patterns
-# ----------------
-
-# Full pipeline in one command
-ns-process-data video --data video/YOUR_VIDEO.MOV --output-dir data/YOUR_VIDEO && ns-train nerfacto --data data/YOUR_VIDEO
-
-# Find your latest checkpoint timestamp
-ls -lt outputs/IMG_7056/nerfacto/
-
-# Create renders directory if it doesn't exist
-mkdir -p renders
+# PyTorch checkpoint errors:
+#   → pip install torch==2.4.0 torchvision==0.19.0
 
 
-## Docker Workflow (For Gaussian Splatting without compilation issues)
-# ---------------------------------------------------------------------
-
-# Pull the official nerfstudio Docker image (one-time setup)
-docker pull ghcr.io/nerfstudio-project/nerfstudio:latest
-
-# Run Docker container with GPU support
-# This mounts your nerfstudio folder to /workspace in the container
-docker run --gpus all \
-  -v /mnt/c/python_work/git/nerfstudio:/workspace \
-  -v ~/.cache:/home/user/.cache \
-  -p 7007:7007 \
-  --rm \
-  -it \
-  --shm-size=12gb \
-  ghcr.io/nerfstudio-project/nerfstudio:latest bash
-
-# Once inside the Docker container:
-cd /workspace
-
-# Train Gaussian Splatting model with custom output directory
-ns-train splatfacto --data data/segmented --output-dir data/segmented
-
-# Train with viewer disabled (avoids viewer bugs)
-ns-train splatfacto --data data/segmented --output-dir data/segmented --viewer.start-on-train False
-
-# Resume training from checkpoint
-ns-train splatfacto --data data/segmented --output-dir data/segmented --load-dir data/segmented/nerfstudio_models/step-XXXXX
-
-
-## Processing Images with COLMAP (Instead of Video)
-# --------------------------------------------------
-
-# Process a folder of images with COLMAP for camera pose estimation
-ns-process-data images --data foreground_images --output-dir data/segmented
-
-# This creates:
-# - data/segmented/images/        - Processed images
-# - data/segmented/transforms.json - Camera poses and intrinsics
-# - data/segmented/colmap/         - COLMAP reconstruction data
-
-
-## Checkpoint Management
+## Other Useful Commands
 # ----------------------
 
-# Checkpoints are saved in the output directory during training
-# Default location: outputs/<dataset>/<method>/<timestamp>/nerfstudio_models/
-# Custom location (if using --output-dir): <output-dir>/nerfstudio_models/
+# Process images instead of video
+ns-process-data images --data IMAGE_FOLDER --output-dir data/my_object
 
-# List all checkpoints
-ls -lh data/segmented/nerfstudio_models/
+# View trained model
+ns-viewer --load-config PATH/config.yml  # Open http://localhost:7007
 
-# Checkpoint naming format:
-# - step-000000.ckpt    - Checkpoint at specific step
-# - step-000010000.ckpt - Checkpoint every 10k steps (default)
+# Resume training
+ns-train splatfacto --data DATA --output-dir OUT --load-dir OUT/nerfstudio_models
 
-# Resume training from last checkpoint
-ns-train splatfacto --data data/segmented --output-dir data/segmented --load-dir data/segmented/nerfstudio_models
+# Find checkpoints
+ls -lt data/my_object/splatfacto/
 
-# Resume from specific checkpoint step
-ns-train splatfacto --data data/segmented --output-dir data/segmented --load-dir data/segmented/nerfstudio_models --load-step 10000
-
-# View trained Gaussian Splatting model
-ns-viewer --load-config data/segmented/splatfacto/<timestamp>/config.yml
-
-
-## Exporting Gaussian Splat Models
-# ---------------------------------
-
-# Export trained splatfacto model to standard Gaussian Splat format (.ply)
-ns-export gaussian-splat --load-config data/segmented/splatfacto/<timestamp>/config.yml --output-dir exports/gaussian_splat/
-
-# The exported .ply file can be viewed in:
-# - Online viewers: https://antimatter15.com/splat/
-# - Desktop: SuperSplat, Polycam, etc.
-
-
-## Cropping Gaussian Splats with SuperSplat
-# ------------------------------------------
-
-# After exporting your gaussian splat to .ply, you can crop it using SuperSplat
-
-# 1. Download SuperSplat desktop app from:
-#    https://github.com/playcanvas/super-splat/releases
-
-# 2. Open SuperSplat and import your .ply file:
-#    File → Import → select your exported .ply file
-#    (or drag and drop the .ply file into SuperSplat)
-
-# 3. Edit/crop the gaussian splat:
-#    - Use selection tools (rectangle, brush) to select gaussians
-#    - Press 'I' to Invert Selection
-#    - Press Delete to remove selected gaussians
-#    - Rotate view to select from different angles
-
-# 4. Export the edited gaussian splat:
-#    File → Export → save as .ply
-#    Example: exports/gaussian_splat/segmentedsplat.ply
-
-
-## Rendering Cropped Gaussian Splats (Docker Method - RECOMMENDED)
-# -----------------------------------------------------------------
-
-# The gsplat library requires C++ compilers which are pre-configured in Docker
-
-# 1. Enter Docker container
-docker run --gpus all \
-  -v /mnt/c/python_work/git/nerfstudio:/workspace \
-  -v ~/.cache:/home/user/.cache \
-  -p 7007:7007 \
-  --rm \
-  -it \
-  --shm-size=12gb \
-  ghcr.io/nerfstudio-project/nerfstudio:latest bash
-
-# 2. Inside Docker, install required dependencies
-pip3 install gsplat packaging plyfile pillow
-
-# 3. Navigate to your gaussian splat directory
-cd /workspace/exports/gaussian_splat
-
-# 4. Render the cropped gaussian splat from multiple angles
-python render_with_gsplat.py --num-views 200
-
-# 5. Render with different background colors
-python render_with_gsplat.py --num-views 200 --bg-mode white   # White background (default)
-python render_with_gsplat.py --num-views 200 --bg-mode black   # Black background
-python render_with_gsplat.py --num-views 200 --bg-mode random  # Random color per frame
-python render_with_gsplat.py --num-views 200 --bg-mode cycle   # Cycle through 10 colors
-
-# 6. Test different camera angles to find the best starting view
-python test_angles.py
-
-# Output will be in: gsplat_renders/ (or test_views/ for test_angles.py)
-
-
-## Extracting Video Frames
-# ------------------------
-
-# Extract frames from a rendered video (for dataset generation)
-mkdir -p exports/gaussian_splat/frames
-ffmpeg -i exports/gaussian_splat/orbit.mp4 exports/gaussian_splat/frames/frame_%04d.png
-
-# This creates individual PNG files: frame_0001.png, frame_0002.png, etc.
-
-
-## Complete Workflow: Video to Cropped Gaussian Renders
-# -------------------------------------------------------
-
-# Step 1: Process your video
-ns-process-data video --data video/IMG_7056.mp4 --output-dir data/unsegmented
-
-# Step 2: Train Gaussian Splatting model (in Docker for best compatibility)
-docker run --gpus all -v /mnt/c/python_work/git/nerfstudio:/workspace -v ~/.cache:/home/user/.cache -p 7007:7007 --rm -it --shm-size=12gb ghcr.io/nerfstudio-project/nerfstudio:latest bash
-cd /workspace
-ns-train splatfacto --data data/unsegmented --output-dir data/unsegmented --viewer.start-on-train False
-
-# Step 3: Export to .ply format (inside Docker)
-ns-export gaussian-splat --load-config data/unsegmented/splatfacto/<timestamp>/config.yml --output-dir exports/gaussian_splat/
-
-# Step 4: Crop in SuperSplat (on host machine, not Docker)
-# - Open SuperSplat desktop app
-# - Import the .ply file from exports/gaussian_splat/
-# - Select unwanted gaussians (background, etc.)
-# - Press 'I' to invert selection, then Delete
-# - Export as segmentedsplat.ply
-
-# Step 5: Render cropped gaussian from multiple angles (inside Docker)
-cd /workspace/exports/gaussian_splat
-pip3 install gsplat packaging plyfile pillow
-python render_with_gsplat.py --num-views 200 --bg-mode cycle
-
-# Output: gsplat_renders/ folder with 200 PNG images
-
-
-## Rendering Scripts Location
-# ----------------------------
-
-# Main rendering script (renders cropped gaussian splat):
-# exports/gaussian_splat/render_with_gsplat.py
-
-# Test script (creates 40 test views to find best angle):
-# exports/gaussian_splat/test_angles.py
-
-# Debug script (checks .ply file contents):
-# exports/gaussian_splat/debug_ply.py
-
-# Simple renderer (basic point cloud rendering for debugging):
-# exports/gaussian_splat/simple_render.py
-
-
-## Important Docker Volume Paths
-# -------------------------------
-
-# When using Docker, your local nerfstudio folder is mounted at:
-# Local: c:\python_work\git\nerfstudio
-# Docker: /workspace
-
-# Updated Docker command for new location (if moved to git/data):
-docker run --gpus all \
-  -v /mnt/c/python_work/git/data/nerfstudio:/workspace \
-  -v ~/.cache:/home/user/.cache \
-  -p 7007:7007 \
-  --rm \
-  -it \
-  --shm-size=12gb \
-  ghcr.io/nerfstudio-project/nerfstudio:latest bash
-
-
-## Notes
-# ------
-# - Replace "IMG_7056" with your video filename (without extension)
-# - Replace "2025-11-24_182849" with your actual checkpoint timestamp
-# - Replace "segmented" with your dataset name
-# - Replace "<timestamp>" with your actual training timestamp
-# - The viewer runs on http://localhost:7007
-# - Press Ctrl+C to stop training or rendering
-# - Training checkpoints are saved automatically every few thousand iterations
-# - Docker method avoids all GCC/CUDA compilation issues on Windows/WSL
-# - Always use full paths when mounting Docker volumes, not relative paths
-# - gsplat library MUST be used inside Docker on Windows due to C++ compiler requirements
-# - SuperSplat editing is done on host machine (Windows), not in Docker
-# - Rendered images are saved as PNG files with transparent or colored backgrounds
+# Monitor GPU
+nvidia-smi
+watch -n 1 nvidia-smi
